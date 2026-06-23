@@ -1,6 +1,6 @@
 const express=require('express');
 const mongoose=require('mongoose');
-const {menue,users,foods,booking,reviews}=require('./schemasmodel');
+const {menue,users,foods,booking,reviews,siteConfig,gallery,sliderImage,eventImages,foodRatings}=require('./schemasmodel');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -12,8 +12,23 @@ const fse = require("fs-extra");
 const multer=require("multer")
 const env = require("dotenv").config();
 
-mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).then(()=>{
+// Prevent server crash from unhandled promise rejections (e.g. duplicate key index build)
+process.on('unhandledRejection', (reason) => {
+    console.warn('⚠️  Unhandled Rejection (server continues running):', reason?.message || reason);
+});
+
+
+mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).then(async ()=>{
     console.log("connected mongoose atlas");
+
+    // Drop legacy students collection if it exists
+    try {
+        const collections = await mongoose.connection.db.listCollections({ name: 'students' }).toArray();
+        if (collections.length > 0) {
+            await mongoose.connection.db.dropCollection('students');
+            console.log('🗑️  students collection dropped');
+        }
+    } catch(e) { /* ignore */ }
 
     const express=require('express');
 
@@ -27,6 +42,8 @@ mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).the
     app.use(bodyParser.urlencoded({ extended: false }));
     app.use(express.json());
     app.use(cookieParser());
+    // Serve uploaded files statically
+    app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
    
 
 
@@ -38,11 +55,40 @@ mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).the
        res.send(menuedata);
     })
 
-    app.get('/foods',async(req,res)=>{
-        const foodsdata = await foods.find();
- 
-        res.send(foodsdata);
-     })
+    app.get('/foods', async (req, res) => {
+        try {
+            const allFoods = await foods.find();
+            // Aggregate ratings for all foods
+            const ratingAgg = await foodRatings.aggregate([
+                { $group: { _id: '$foodId', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+            ]);
+            const ratingMap = {};
+            ratingAgg.forEach(r => { ratingMap[r._id.toString()] = { avg: r.avg, count: r.count }; });
+
+            // Count likes per food from users collection
+            const allUsers = await users.find({ likes: { $exists: true, $ne: [] } }, { likes: 1 });
+            const likeMap = {};
+            allUsers.forEach(u => {
+                (u.likes || []).forEach(fid => {
+                    const key = fid.toString();
+                    likeMap[key] = (likeMap[key] || 0) + 1;
+                });
+            });
+
+            const result = allFoods.map(f => {
+                const stats = ratingMap[f._id.toString()] || { avg: 0, count: 0 };
+                return {
+                    ...f.toObject(),
+                    avgUserRating: Math.round(stats.avg * 10) / 10,
+                    ratingCount: stats.count,
+                    likeCount: likeMap[f._id.toString()] || 0
+                };
+            });
+            res.json(result);
+        } catch(error) {
+            res.status(500).json({ message: 'Failed to get foods', error });
+        }
+    })
 
        // ---for admin pannel menue part---
 
@@ -192,16 +238,8 @@ mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).the
 
     app.post("/foods",async (req, res) => {
       try {
-        const { name, price, type,img } = req.body;
-    
-      
-        const fdata = new foods({
-          name,
-          img,
-          price,
-          type,
-        });
-    
+        const { name, price, type, img, description } = req.body;
+        const fdata = new foods({ name, img, price, type, description: description || '' });
         const savedFoods = await fdata.save();
         res.status(201).json(savedFoods);
       } catch (error) {
@@ -276,23 +314,13 @@ mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).the
     app.put("/foods/:id", async (req, res) => {
       try {
         const foodItem = await foods.findById(req.params.id);
-    
-        if (!foodItem) {
-          return res.status(404).json({ message: "Food item not found" });
-        }
-    
-        // Update text fields
-        foodItem.name = req.body.name;
-        foodItem.price = req.body.price;
-        foodItem.type = req.body.type;
-        foodItem.img=req.body.img
-    
-        // Handle image file update
-    
-    
-        // Save the updated food item
+        if (!foodItem) return res.status(404).json({ message: "Food item not found" });
+        foodItem.name  = req.body.name  ?? foodItem.name;
+        foodItem.price = req.body.price ?? foodItem.price;
+        foodItem.type  = req.body.type  ?? foodItem.type;
+        foodItem.img   = req.body.img   ?? foodItem.img;
+        foodItem.description = req.body.description ?? foodItem.description;
         await foodItem.save();
-    
         res.status(200).json(foodItem);
       } catch (error) {
         console.error("Error updating food item:", error);
@@ -557,6 +585,262 @@ mongoose.connect(process.env.mongodbConnectionString,{useNewUrlParser:true}).the
         await rdata.deleteOne();
         res.send(rdata)
     })     
+
+    // ========== SITE CONFIGURATION ROUTES ==========
+
+    // GET config — returns the one config document (upsert if none exists)
+    app.get('/config', async (req, res) => {
+        try {
+            let config = await siteConfig.findOne();
+            if (!config) {
+                config = new siteConfig({ logoUrl: '', siteName: 'Kudoz Restro' });
+                await config.save();
+            }
+            res.json(config);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to get config', error });
+        }
+    });
+
+    // PUT config — update logo URL and/or site name
+    app.put('/config', async (req, res) => {
+        try {
+            let config = await siteConfig.findOne();
+            if (!config) {
+                config = new siteConfig();
+            }
+            if (req.body.logoUrl !== undefined) config.logoUrl = req.body.logoUrl;
+            if (req.body.siteName !== undefined) config.siteName = req.body.siteName;
+            config.updatedAt = Date.now();
+            await config.save();
+            res.json(config);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to update config', error });
+        }
+    });
+
+    // ========== GALLERY ROUTES ==========
+
+    // GET all gallery images (sorted by order field)
+    app.get('/gallery', async (req, res) => {
+        try {
+            const galleryData = await gallery.find().sort({ order: 1 });
+            res.json(galleryData);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to get gallery', error });
+        }
+    });
+
+    // POST — add a new gallery image
+    app.post('/gallery', async (req, res) => {
+        try {
+            const { title, img, size, order } = req.body;
+            const gdata = new gallery({ title, img, size, order });
+            const saved = await gdata.save();
+            res.status(201).json(saved);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to add gallery image', error });
+        }
+    });
+
+    // PUT — update a gallery image
+    app.put('/gallery/:id', async (req, res) => {
+        try {
+            const gdata = await gallery.findById(req.params.id);
+            if (!gdata) return res.status(404).json({ message: 'Gallery image not found' });
+            if (req.body.title !== undefined) gdata.title = req.body.title;
+            if (req.body.img !== undefined) gdata.img = req.body.img;
+            if (req.body.size !== undefined) gdata.size = req.body.size;
+            if (req.body.order !== undefined) gdata.order = req.body.order;
+            const updated = await gdata.save();
+            res.json(updated);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to update gallery image', error });
+        }
+    });
+
+    // DELETE — remove a gallery image
+    app.delete('/gallery/:id', async (req, res) => {
+        try {
+            const gdata = await gallery.findById(req.params.id);
+            if (!gdata) return res.status(404).json({ message: 'Gallery image not found' });
+            await gdata.deleteOne();
+            res.json({ message: 'Gallery image deleted', data: gdata });
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to delete gallery image', error });
+        }
+    });
+
+    // =============================================
+    // SLIDER IMAGE ROUTES
+    // =============================================
+
+    // GET — fetch current slider/hero image
+    app.get('/slider-image', async (req, res) => {
+        try {
+            let doc = await sliderImage.findOne();
+            if (!doc) { doc = await new sliderImage({ imgUrl: '' }).save(); }
+            res.json(doc);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to fetch slider image', error });
+        }
+    });
+
+    // PUT — update slider/hero image
+    app.put('/slider-image', async (req, res) => {
+        try {
+            let doc = await sliderImage.findOne();
+            if (!doc) doc = new sliderImage();
+            if (req.body.imgUrl !== undefined) doc.imgUrl = req.body.imgUrl;
+            doc.updatedAt = Date.now();
+            const saved = await doc.save();
+            res.json(saved);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to update slider image', error });
+        }
+    });
+
+    // =============================================
+    // EVENT IMAGES ROUTES (max 5)
+    // =============================================
+
+    // GET — fetch all event images sorted by order
+    app.get('/event-images', async (req, res) => {
+        try {
+            const images = await eventImages.find().sort({ order: 1 });
+            res.json(images);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to fetch event images', error });
+        }
+    });
+
+    // POST — add a new event image (max 5)
+    app.post('/event-images', async (req, res) => {
+        try {
+            const count = await eventImages.countDocuments();
+            if (count >= 5) {
+                return res.status(400).json({ message: 'Maximum 5 event images allowed. Delete one first.' });
+            }
+            const newImg = new eventImages({
+                img:   req.body.img,
+                alt:   req.body.alt   || 'Event',
+                order: req.body.order || count
+            });
+            const saved = await newImg.save();
+            res.status(201).json(saved);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to add event image', error });
+        }
+    });
+
+    // DELETE — remove an event image
+    app.delete('/event-images/:id', async (req, res) => {
+        try {
+            const doc = await eventImages.findById(req.params.id);
+            if (!doc) return res.status(404).json({ message: 'Event image not found' });
+            await doc.deleteOne();
+            res.json({ message: 'Event image deleted', data: doc });
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to delete event image', error });
+        }
+    });
+
+    // =============================================
+    // FOOD RATING ROUTES
+    // =============================================
+
+    // POST /foods/:id/rate  — user submits a rating (upsert)
+    app.post('/foods/:id/rate', async (req, res) => {
+        try {
+            const { userId, rating } = req.body;
+            if (!userId) return res.status(401).json({ message: 'Login required to rate' });
+            const r = parseFloat(rating);
+            if (isNaN(r) || r < 1 || r > 5) return res.status(400).json({ message: 'Rating must be 1–5' });
+
+            await foodRatings.findOneAndUpdate(
+                { foodId: req.params.id, userId },
+                { rating: r, createdAt: new Date() },
+                { upsert: true, new: true }
+            );
+
+            // Return updated stats
+            const agg = await foodRatings.aggregate([
+                { $match: { foodId: new require('mongoose').Types.ObjectId(req.params.id) } },
+                { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+            ]);
+            const stats = agg[0] || { avg: 0, count: 0 };
+            res.json({ avgUserRating: Math.round(stats.avg * 10) / 10, ratingCount: stats.count, yourRating: r });
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to submit rating', error });
+        }
+    });
+
+    // GET /foods/:id/ratings  — get rating stats + user's own rating
+    app.get('/foods/:id/ratings', async (req, res) => {
+        try {
+            const { userId } = req.query;
+            const agg = await foodRatings.aggregate([
+                { $match: { foodId: new require('mongoose').Types.ObjectId(req.params.id) } },
+                { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+            ]);
+            const stats = agg[0] || { avg: 0, count: 0 };
+            let yourRating = 0;
+            if (userId) {
+                const existing = await foodRatings.findOne({ foodId: req.params.id, userId });
+                if (existing) yourRating = existing.rating;
+            }
+            res.json({ avgUserRating: Math.round(stats.avg * 10) / 10, ratingCount: stats.count, yourRating });
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to get ratings', error });
+        }
+    });
+
+    // PUT /foods/:id/admin-boost  — admin sets boost (0–5), separate from user avg
+    app.put('/foods/:id/admin-boost', async (req, res) => {
+        try {
+            const foodItem = await foods.findById(req.params.id);
+            if (!foodItem) return res.status(404).json({ message: 'Food not found' });
+            const boost = parseFloat(req.body.adminRatingBoost);
+            if (isNaN(boost) || boost < 0 || boost > 5) return res.status(400).json({ message: 'Boost must be 0–5' });
+            foodItem.adminRatingBoost = boost;
+            await foodItem.save();
+            res.json(foodItem);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to update admin boost', error });
+        }
+    });
+
+    // GET /admin/food-ratings  — all foods with their user rating stats
+    app.get('/admin/food-ratings', async (req, res) => {
+        try {
+            const allFoods = await foods.find();
+            const ratingAgg = await foodRatings.aggregate([
+                { $group: { _id: '$foodId', avg: { $avg: '$rating' }, count: { $sum: 1 } } }
+            ]);
+            const ratingMap = {};
+            ratingAgg.forEach(r => { ratingMap[r._id.toString()] = { avg: r.avg, count: r.count }; });
+
+            // Like counts
+            const allUsers = await users.find({ likes: { $exists: true, $ne: [] } }, { likes: 1 });
+            const likeMap = {};
+            allUsers.forEach(u => {
+                (u.likes || []).forEach(fid => {
+                    const key = fid.toString();
+                    likeMap[key] = (likeMap[key] || 0) + 1;
+                });
+            });
+
+            const result = allFoods.map(f => ({
+                ...f.toObject(),
+                avgUserRating: Math.round((ratingMap[f._id.toString()]?.avg || 0) * 10) / 10,
+                ratingCount: ratingMap[f._id.toString()]?.count || 0,
+                likeCount: likeMap[f._id.toString()] || 0
+            }));
+            res.json(result);
+        } catch (error) {
+            res.status(500).json({ message: 'Failed to get food ratings', error });
+        }
+    });
 
     app.listen(3030,()=>{
         console.log("server started")

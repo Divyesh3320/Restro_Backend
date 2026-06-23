@@ -43,7 +43,9 @@ const foodschema=mongoose.Schema({
     img:String,
     name:String,
     price:Number,
-    type:String
+    type:String,
+    description: { type: String, default: '' },
+    adminRatingBoost: { type: Number, default: 0, min: 0, max: 5 }
 });
 
 const bookingchema=mongoose.Schema({
@@ -66,16 +68,63 @@ const reviewschema=mongoose.Schema({
     status:String
 });
 
+// ---- Food User Ratings (one per user per food) ----
+const foodRatingSchema = mongoose.Schema({
+    foodId: { type: mongoose.Schema.Types.ObjectId, ref: 'foods', required: true },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User',  required: true },
+    rating: { type: Number, required: true, min: 1, max: 5 },
+    createdAt: { type: Date, default: Date.now }
+});
+foodRatingSchema.index({ foodId: 1, userId: 1 }, { unique: true });
+
 booking=mongoose.model("Booking",bookingchema)
 users=mongoose.model('User',usersschema);
 menue= mongoose.model('Menue',menueschema);
 foods=mongoose.model('foods',foodschema)
 reviews=mongoose.model('review',reviewschema);
+foodRatings=mongoose.model('FoodRating',foodRatingSchema);
+
+// ---- Site Configuration Schema ----
+const siteConfigSchema = mongoose.Schema({
+    logoUrl: { type: String, default: '' },
+    siteName: { type: String, default: 'Kudoz Restro' },
+    updatedAt: { type: Date, default: Date.now }
+});
+siteConfig = mongoose.model('SiteConfig', siteConfigSchema);
+
+// ---- Gallery Schema ----
+const gallerySchema = mongoose.Schema({
+    title: { type: String, default: '' },
+    img: { type: String, required: true },
+    size: { type: String, default: 'small' },
+    order: { type: Number, default: 0 }
+});
+gallery = mongoose.model('Gallery', gallerySchema);
+
+// ---- Hero/Slider Image Schema (single document) ----
+const sliderImageSchema = mongoose.Schema({
+    imgUrl:    { type: String, default: '' },
+    updatedAt: { type: Date,   default: Date.now }
+});
+sliderImage = mongoose.model('SliderImage', sliderImageSchema);
+
+// ---- Event Section Images Schema (max 5 images) ----
+const eventImageSchema = mongoose.Schema({
+    img:   { type: String, required: true },
+    alt:   { type: String, default: 'Event' },
+    order: { type: Number, default: 0 }
+});
+eventImages = mongoose.model('EventImage', eventImageSchema);
 
 module.exports = {
-    menue: menue,
-    foods:foods,
-    users:users,
-    booking:booking,
-    reviews:reviews
+    menue:        menue,
+    foods:        foods,
+    users:        users,
+    booking:      booking,
+    reviews:      reviews,
+    siteConfig:   siteConfig,
+    gallery:      gallery,
+    sliderImage:  sliderImage,
+    eventImages:  eventImages,
+    foodRatings:  foodRatings
 };
